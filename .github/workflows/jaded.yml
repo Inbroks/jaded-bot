@@ -1,0 +1,88 @@
+name: Jaded bot
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # проверка сайта раз в ~10 минут (GitHub может опаздывать)
+    - cron: "17 3 1 * *"     # раз в месяц: «пульс», чтобы GitHub не отключил расписание
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "run — обычный проход; check — проверить доступ к сайту и Telegram"
+        type: choice
+        options: [run, check]
+        default: run
+
+# запуски не должны идти одновременно — иначе они перезапишут состояние друг друга
+concurrency:
+  group: jaded-bot
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # нужно только для ежемесячного «пульса» (пустой коммит)
+
+jobs:
+  bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      PYTHONUNBUFFERED: "1"
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      REGIONS: "DE,GB"              # DE — Германия (EUR), GB — Англия (GBP)
+      INCLUDE_UNISEX: "1"           # 0 — только мужские вещи, без унисекса
+      REQUEST_DELAY_SECONDS: "1.5"
+      MAX_CARDS_PER_CYCLE: "40"
+      DB_PATH: state/state.sqlite3
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      # ---- режим проверки (запускается вручную) ----
+      - name: Проверка доступа и Telegram
+        if: github.event.inputs.mode == 'check'
+        run: python jaded_bot.py --check
+
+      # ---- обычный режим ----
+      - name: Восстановить состояние
+        if: github.event.inputs.mode != 'check'
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: jaded-state-${{ github.run_id }}
+          restore-keys: jaded-state-   # берётся самый свежий сохранённый снимок
+
+      - name: Запомнить хэш состояния до запуска
+        if: github.event.inputs.mode != 'check'
+        run: echo "STATE_BEFORE=$(sha256sum state/state.sqlite3 2>/dev/null | cut -d' ' -f1)" >> "$GITHUB_ENV"
+
+      - name: Проверить сайт и разослать уведомления
+        if: github.event.inputs.mode != 'check'
+        run: python jaded_bot.py --once
+
+      - name: Хэш состояния после запуска
+        id: state
+        if: ${{ !cancelled() && github.event.inputs.mode != 'check' }}
+        run: echo "hash=$(sha256sum state/state.sqlite3 2>/dev/null | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      # кэш неизменяем, поэтому новый снимок пишем только если что-то поменялось
+      - name: Сохранить состояние
+        if: ${{ !cancelled() && github.event.inputs.mode != 'check' && env.STATE_BEFORE != steps.state.outputs.hash }}
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: jaded-state-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # ---- ежемесячный «пульс» ----
+      - name: Пульс (пустой коммит раз в месяц)
+        if: github.event.schedule == '17 3 1 * *'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty -m "keepalive"
+          git push
