@@ -77,6 +77,7 @@ class Config:
     request_delay: float
     max_cards: int
     unisex_tags: set = field(default_factory=set)
+    require_all_regions: bool = True
 
     def scope_signature(self) -> str:
         """Подпись фильтра товаров: при её смене состояние пересобирается молча."""
@@ -110,6 +111,8 @@ class Config:
             men_tags=men_tags,
             request_delay=float(os.getenv("REQUEST_DELAY_SECONDS", "2.0")),
             max_cards=int(os.getenv("MAX_CARDS_PER_CYCLE", "40")),
+            require_all_regions=os.getenv("REQUIRE_ALL_REGIONS", "1").strip().lower()
+            not in ("0", "false", "no"),
         )
 
 
@@ -332,62 +335,133 @@ def product_url(code: str, p: Product) -> str:
     return f"{BASE}{REGIONS[code]['path']}/products/{p.handle}"
 
 
-def build_message(code: str, p: Product, r: dict):
-    reg = REGIONS[code]
-    cur = reg["currency"]
-    esc = html.escape
+EVENT_ORDER = ("new", "sale", "drop", "sizes")
+HEADS = {
+    "new": "🔥 <b>Новая вещь со скидкой</b>",
+    "sale": "🏷 <b>Началась скидка</b>",
+    "drop": "📉 <b>Цена снизилась</b>",
+    "sizes": "📏 <b>Новые размеры (вещь со скидкой)</b>",
+}
+TAGS = {"new": "🔥", "sale": "🏷", "drop": "📉", "sizes": "📏"}
+# короткая пометка для региона, у которого событие иное, чем в заголовке
+SHORT = {"new": "🔥 новая вещь со скидкой", "sale": "🏷 началась скидка"}
 
+
+def event_kind(r: dict) -> str:
+    return "new" if r["is_new"] else "sale" if r["sale_started"] else "drop" if r["drops"] else "sizes"
+
+
+def head_kind(events: dict) -> str:
+    """Главное событие вещи среди регионов (new > sale > drop > sizes)."""
+    return min((event_kind(r) for _, r in events.values()), key=EVENT_ORDER.index)
+
+
+def region_rep(p: Product):
+    """(доступные варианты, «представительный» вариант: самый дешёвый со скидкой, иначе самый дешёвый)."""
     avail = [v for v in p.variants.values() if v.available]
-    sale = [v for v in avail if v.on_sale]
-    rep = min(sale or avail, key=lambda v: v.price)
+    if not avail:
+        return avail, None
+    return avail, min([v for v in avail if v.on_sale] or avail, key=lambda v: v.price)
 
-    if r["is_new"]:
-        head = "🔥 <b>Новая вещь со скидкой</b>"
-    elif r["sale_started"]:
-        head = "🏷 <b>Началась скидка</b>"
-    elif r["drops"]:
-        head = "📉 <b>Цена снизилась</b>"
-    else:
-        head = "📏 <b>Новые размеры (вещь со скидкой)</b>"
 
-    lines = [f"{head} · {reg['label']}", f"<b>{esc(p.title)}</b>"]
-    if p.unisex:
+def flag_of(code: str) -> str:
+    return REGIONS[code]["label"].split()[0]
+
+
+def build_card(events: dict, current: dict, regions: list, compact: bool = False):
+    """Одно уведомление по вещи для всех версий сайта. Формат — как у обычной карточки;
+    если стран несколько, отличается только тем, что цена (и ссылка) указаны для каждой страны с флагом.
+
+    events:  {код региона: (Product, diff)} — где по вещи есть событие;
+    current: {код региона: Product} — актуальные данные вещи во всех версиях сайта;
+    для региона без события показываем его текущую цену, чтобы цены можно было сравнить."""
+    esc = html.escape
+    codes = [c for c in regions if c in current]
+    multi = len(codes) > 1
+    hk = head_kind(events)
+    first = next(events[c][0] for c in codes if c in events)
+
+    def fl(c: str) -> str:  # флаг-префикс строки (только когда стран несколько)
+        return flag_of(c) + " " if multi else ""
+
+    # одна страна — как раньше: «заголовок · 🇬🇧 Англия»; несколько — страны видны по флагам в строках цен
+    lines = [HEADS[hk] + ("" if multi else f" · {REGIONS[codes[0]]['label']}"), f"<b>{esc(first.title)}</b>"]
+    if any(current[c].unisex for c in codes):
         lines.append("👥 Унисекс")
-
-    colors = sorted({v.color for v in avail if v.color})
+    colors = sorted({v.color for c in codes for v in current[c].variants.values()
+                     if v.available and v.color})
     if colors:
         lines.append("Цвет: " + esc(", ".join(colors)))
 
-    price_line = f"💰 <b>{money(rep.price, cur)}</b>"
-    if rep.on_sale:
-        price_line += f"  <s>{money(rep.compare, cur)}</s>  (−{pct(rep)}%)"
-    lines.append(price_line)
+    reps = {c: region_rep(current[c]) for c in codes}  # (доступные варианты, главный вариант)
+    for c in codes:
+        _, rep = reps[c]
+        if rep is None:
+            lines.append(f"{fl(c)}нет в наличии")
+            continue
+        cur = REGIONS[c]["currency"]
+        price_line = f"{fl(c)}💰 <b>{money(rep.price, cur)}</b>"
+        if rep.on_sale:
+            price_line += f"  <s>{money(rep.compare, cur)}</s>  (−{pct(rep)}%)"
+        lines.append(price_line)
 
-    if r["drops"]:
-        v, old_price = min(r["drops"], key=lambda t: t[0].price)
-        lines.append(f"📉 Было {money(old_price, cur)} → стало {money(v.price, cur)}")
+    for c in codes:  # у региона событие иное, чем в заголовке (например, новая вещь против начала скидки)
+        if c in events:
+            kind = event_kind(events[c][1])
+            if kind != hk and kind in SHORT:
+                lines.append(f"{fl(c)}{SHORT[kind]}")
+    for c in codes:
+        if c in events and events[c][1]["drops"]:
+            v, old_price = min(events[c][1]["drops"], key=lambda t: t[0].price)
+            cur = REGIONS[c]["currency"]
+            lines.append(f"{fl(c)}📉 Было {money(old_price, cur)} → стало {money(v.price, cur)}")
 
-    if r["new_sizes"] and not r["is_new"]:
-        sizes = ", ".join(dict.fromkeys(v.size for v in r["new_sizes"]))
-        lines.append(f"➕ Новые размеры: <b>{esc(sizes)}</b>")
+    groups = {}  # новые размеры: одинаковые в разных странах — одной строкой
+    for c in codes:
+        if c in events:
+            r = events[c][1]
+            if r["new_sizes"] and not r["is_new"]:
+                s = ", ".join(dict.fromkeys(v.size for v in r["new_sizes"]))
+                groups.setdefault(s, []).append(c)
+    for s, cs in groups.items():
+        who = "" if (not multi or len(cs) == len(codes)) else " " + " ".join(flag_of(c) for c in cs)
+        lines.append(f"➕ Новые размеры{who}: <b>{esc(s)}</b>")
 
-    all_sizes = ", ".join(dict.fromkeys(v.size for v in avail))
-    lines.append(f"Размеры в наличии: {esc(all_sizes)}")
-    lines.append(f"🔗 {product_url(code, p)}")
+    if not compact:
+        sizes = {c: ", ".join(dict.fromkeys(v.size for v in reps[c][0]))
+                 for c in codes if reps[c][1] is not None}
+        if len(set(sizes.values())) == 1:
+            lines.append("Размеры в наличии: " + esc(next(iter(sizes.values()))))
+        else:
+            for c, s in sizes.items():
+                lines.append(f"{fl(c)}Размеры в наличии: {esc(s)}")
+    for c in codes:
+        lines.append(f"🔗 {fl(c)}{product_url(c, current[c])}")
 
-    photo = ""
-    if p.image:
-        photo = p.image + ("&" if "?" in p.image else "?") + "width=800"
-    return "\n".join(lines)[:1000], photo
+    text = "\n".join(lines)
+    if len(text) > 1000 and not compact:
+        return build_card(events, current, regions, compact=True)
+    if len(text) > 1000:  # теги не пересекают строки, поэтому режем по границе строки
+        text = text[:1000].rsplit("\n", 1)[0]
+    image = next((current[c].image for c in codes if current[c].image), "")
+    photo = image + ("&" if "?" in image else "?") + "width=800" if image else ""
+    return text, photo
 
 
-def build_digest_line(code: str, p: Product, r: dict) -> str:
-    cur = REGIONS[code]["currency"]
-    avail = [v for v in p.variants.values() if v.available]
-    rep = min([v for v in avail if v.on_sale] or avail, key=lambda v: v.price)
-    tag = "🔥" if r["is_new"] else "🏷" if r["sale_started"] else "📉" if r["drops"] else "📏"
-    old = f" (было {money(rep.compare, cur)})" if rep.on_sale else ""
-    return f"{tag} {html.escape(p.title)} — {money(rep.price, cur)}{old}\n{product_url(code, p)}"
+def build_digest_item(events: dict, current: dict, regions: list) -> str:
+    codes = [c for c in regions if c in current]
+    first = next(events[c][0] for c in codes if c in events)
+    lines = [f"{TAGS[head_kind(events)]} {html.escape(first.title)}"]
+    for c in codes:
+        cur = REGIONS[c]["currency"]
+        _, rep = region_rep(current[c])
+        flag = flag_of(c)
+        if rep is None:
+            price = "нет в наличии"
+        else:
+            price = money(rep.price, cur) + (f" (было {money(rep.compare, cur)})" if rep.on_sale else "")
+        lines.append(f"{flag} {price} — {product_url(c, current[c])}")
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- #
@@ -524,8 +598,21 @@ def fetch_catalog(session: requests.Session, code: str, delay: float,
 # --------------------------------------------------------------------------- #
 # Обработка региона
 # --------------------------------------------------------------------------- #
-def process_products(cfg: Config, db: DB, code: str, mens: list, notifier) -> dict:
-    """Сравнивает каталог со снимком, шлёт уведомления, обновляет снимок."""
+def fetch_region(cfg: Config, code: str) -> list:
+    """Каталог версии сайта -> список подходящих (мужских и унисекс) товаров."""
+    session = make_session(code)
+    raw = fetch_catalog(session, code, cfg.request_delay)
+    mens = []
+    for p in raw:
+        g = gender(p, cfg.men_tags, cfg.unisex_tags)
+        if g:
+            mens.append(parse_product(p, unisex=(g == "unisex")))
+    log.info("%s: в каталоге %d товаров, подходящих (муж.+унисекс) %d", code, len(raw), len(mens))
+    return mens
+
+
+def plan_region(cfg: Config, db: DB, code: str, mens: list) -> dict:
+    """Сравнивает каталог региона со снимком. Ничего не пишет в БД и ничего не отправляет."""
     known = db.count(code)
     if known >= 50 and len(mens) < known * 0.5:
         raise RegionError(f"{code}: получено {len(mens)} мужских товаров при {known} в базе — "
@@ -536,66 +623,81 @@ def process_products(cfg: Config, db: DB, code: str, mens: list, notifier) -> di
     # при первом запуске или смене фильтра (например, добавили унисекс) новые позиции
     # запоминаем молча, чтобы не получить уведомления обо всех уже существующих скидках
     baseline = first_run or scope_changed
-    to_save, events = [], []
+    unchanged, events = [], {}
     for p in mens:
-        old = db.get(code, p.id)
         if baseline:
-            to_save.append(p)
+            unchanged.append(p)
             continue
-        r = diff(old, p)
+        r = diff(db.get(code, p.id), p)
         if r:
-            events.append((p, r))
+            events[p.id] = (p, r)
         else:
-            to_save.append(p)  # изменений для уведомления нет — просто обновляем снимок
-    if to_save:
-        db.save_many(code, to_save)
+            unchanged.append(p)  # изменений для уведомления нет — просто обновляем снимок
+    return {"code": code, "mens": mens, "first_run": first_run, "baseline": baseline,
+            "unchanged": unchanged, "events": events}
 
-    sent = failed = 0
-    cards, rest = events[:cfg.max_cards], events[cfg.max_cards:]
-    for p, r in cards:
-        text, photo = build_message(code, p, r)
-        if notifier.send(text, photo):
-            db.save_many(code, [p])  # снимок обновляем только после успешной отправки
-            sent += 1
-        else:
-            failed += 1  # снимок не трогаем — повторим в следующем цикле
+
+def process_plans(cfg: Config, db: DB, plans: list, notifier) -> dict:
+    """Объединяет события по вещам из всех регионов и шлёт ОДНО уведомление на вещь
+    (с ценами для каждой версии сайта). Снимок вещи обновляется только после успешной отправки."""
+    regions = [pl["code"] for pl in plans]
+    stats = {pl["code"]: {"men": len(pl["mens"]), "events": len(pl["events"]), "sent": 0,
+                          "failed": 0, "baseline": pl["baseline"]} for pl in plans}
+    for pl in plans:
+        if pl["unchanged"]:
+            db.save_many(pl["code"], pl["unchanged"])
+
+    current = {}  # id вещи -> {регион: Product}
+    for pl in plans:
+        for p in pl["mens"]:
+            current.setdefault(p.id, {})[pl["code"]] = p
+    merged = {}  # id вещи -> {регион: (Product, diff)}; порядок — по первому появлению
+    for pl in plans:
+        for pid, pr in pl["events"].items():
+            merged.setdefault(pid, {})[pl["code"]] = pr
+    items = list(merged.items())
+
+    def done(evs, ok: bool, n: int = 1):
+        for code, (p, _) in evs.items():
+            if ok:
+                db.save_many(code, [p])  # снимок обновляем только после успешной отправки
+                stats[code]["sent"] += n
+            else:
+                stats[code]["failed"] += n  # снимок не трогаем — повторим в следующем цикле
+
+    cards, rest = items[:cfg.max_cards], items[cfg.max_cards:]
+    for pid, evs in cards:
+        text, photo = build_card(evs, current[pid], regions)
+        done(evs, notifier.send(text, photo))
 
     # если событий слишком много (например, старт распродажи) — компактные сводки
     for i in range(0, len(rest), 12):
         chunk = rest[i:i + 12]
-        text = f"{REGIONS[code]['label']} · ещё {len(rest)} позиций (сводка)\n\n" + "\n\n".join(
-            build_digest_line(code, p, r) for p, r in chunk)
-        if notifier.send(text[:4000]):
-            db.save_many(code, [p for p, _ in chunk])
-            sent += len(chunk)
-        else:
-            failed += len(chunk)
+        text = f"Ещё {len(rest)} позиций (сводка)\n\n" + "\n\n".join(
+            build_digest_item(evs, current[pid], regions) for pid, evs in chunk)
+        ok = notifier.send(text[:4000])
+        for _, evs in chunk:
+            done(evs, ok)
 
-    if baseline:
+    for pl in plans:
+        if not pl["baseline"]:
+            continue
+        code = pl["code"]
         db.meta_set(f"baseline:{code}", datetime.now(timezone.utc).isoformat())
         db.meta_set(f"scope:{code}", cfg.scope_signature())
-        on_sale = sum(1 for p in mens if p.any_on_sale)
-        uni = sum(1 for p in mens if p.unisex)
-        title = "✅ Бот запущен" if first_run else "🔄 Фильтр товаров обновлён"
+        on_sale = sum(1 for p in pl["mens"] if p.any_on_sale)
+        uni = sum(1 for p in pl["mens"] if p.unisex)
+        title = "✅ Бот запущен" if pl["first_run"] else "🔄 Фильтр товаров обновлён"
         notifier.send(
             f"{title} · {REGIONS[code]['label']}\n"
-            f"Базовый снимок: {len(mens)} товаров (из них унисекс: {uni}), со скидкой: {on_sale}.\n"
+            f"Базовый снимок: {len(pl['mens'])} товаров (из них унисекс: {uni}), со скидкой: {on_sale}.\n"
             f"Дальше буду присылать только новые скидки, снижения цен и новые размеры.")
-
-    return {"men": len(mens), "events": len(events), "sent": sent, "failed": failed,
-            "baseline": baseline}
+    return stats
 
 
-def run_region(cfg: Config, db: DB, code: str, notifier) -> dict:
-    session = make_session(code)
-    raw = fetch_catalog(session, code, cfg.request_delay)
-    mens = []
-    for p in raw:
-        g = gender(p, cfg.men_tags, cfg.unisex_tags)
-        if g:
-            mens.append(parse_product(p, unisex=(g == "unisex")))
-    log.info("%s: в каталоге %d товаров, подходящих (муж.+унисекс) %d", code, len(raw), len(mens))
-    return process_products(cfg, db, code, mens, notifier)
+def process_products(cfg: Config, db: DB, code: str, mens: list, notifier) -> dict:
+    """Один регион (удобная обёртка: план + отправка)."""
+    return process_plans(cfg, db, [plan_region(cfg, db, code, mens)], notifier)[code]
 
 
 def run_cycle(cfg: Config, db: DB, notifier) -> bool:
@@ -606,10 +708,10 @@ def run_cycle(cfg: Config, db: DB, notifier) -> bool:
         log.info("Кулдаун после HTTP 429: осталось %d мин, пропускаю проход",
                  (until - time.time()) // 60 + 1)
         return True
+    plans, failed = [], []
     for code in cfg.regions:
         try:
-            res = run_region(cfg, db, code, notifier)
-            log.info("%s: %s", code, res)
+            plans.append(plan_region(cfg, db, code, fetch_region(cfg, code)))
             db.meta_set(f"err_alert:{code}", "0")
         except RateLimited as e:
             log.warning("Сайт ограничил частоту запросов (%s). Пауза 30 минут.", e)
@@ -622,13 +724,26 @@ def run_cycle(cfg: Config, db: DB, notifier) -> bool:
             return True
         except Exception as e:  # noqa: BLE001
             log.error("%s: ошибка: %s", code, e)
+            failed.append(code)
             # не чаще раза в 6 часов сообщаем об ошибке в Telegram
             last = float(db.meta_get(f"err_alert:{code}") or 0)
             if time.time() - last > 6 * 3600:
+                extra = ("\nПока эта версия недоступна, уведомления по остальным приостановлены "
+                         "(чтобы не слать неполные данные)."
+                         if cfg.require_all_regions and len(cfg.regions) > 1 else "")
                 notifier.send(f"⚠️ {REGIONS[code]['label']}: не удалось обновить данные.\n"
-                              f"{html.escape(str(e))[:300]}")
+                              f"{html.escape(str(e))[:300]}{extra}")
                 db.meta_set(f"err_alert:{code}", str(time.time()))
         time.sleep(cfg.request_delay)
+
+    if failed and cfg.require_all_regions and len(cfg.regions) > 1:
+        # одна вещь = одно уведомление с ценами из обеих версий, поэтому без полных данных
+        # ничего не шлём и снимок не трогаем: вещи обработаются, когда сайт ответит целиком
+        log.warning("Не получены версии: %s — отправку и обновление снимка пропускаю", ", ".join(failed))
+        return False
+    if plans:
+        for code, st in process_plans(cfg, db, plans, notifier).items():
+            log.info("%s: %s", code, st)
     return False
 
 
