@@ -28,8 +28,8 @@ jobs:
       PYTHONUNBUFFERED: "1"
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      REGIONS: "DE,GB"              # DE — Германия (EUR), GB — Англия (GBP)
-      INCLUDE_UNISEX: "1"           # 0 — только мужские вещи, без унисекса
+      REGIONS: "GB,DE"              # DE — Германия (EUR), GB — Англия (GBP)
+      INCLUDE_UNISEX: "0"           # 0 — только мужские вещи, без унисекса
       REQUEST_DELAY_SECONDS: "1.5"
       MAX_CARDS_PER_CYCLE: "40"
       DB_PATH: state/state.sqlite3
