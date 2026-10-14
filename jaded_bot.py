@@ -66,6 +66,11 @@ def load_env(path: Path) -> None:
         os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
 
+def env_str(name: str, default: str) -> str:
+    """Переменная окружения; пустое значение (например, пустая переменная в GitHub) = значение по умолчанию."""
+    return os.getenv(name, "").strip() or default
+
+
 @dataclass
 class Config:
     token: str
@@ -105,12 +110,12 @@ class Config:
             unisex_tags=unisex_tags,
             token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
             chat_ids=[c.strip() for c in os.getenv("TELEGRAM_CHAT_ID", "").split(",") if c.strip()],
-            interval=int(os.getenv("CHECK_INTERVAL_SECONDS", "600")),
+            interval=int(env_str("CHECK_INTERVAL_SECONDS", "600")),
             regions=regions,
             db_path=Path(os.getenv("DB_PATH", str(HERE / "state.sqlite3"))),
             men_tags=men_tags,
-            request_delay=float(os.getenv("REQUEST_DELAY_SECONDS", "2.0")),
-            max_cards=int(os.getenv("MAX_CARDS_PER_CYCLE", "40")),
+            request_delay=float(env_str("REQUEST_DELAY_SECONDS", "2.0")),
+            max_cards=int(env_str("MAX_CARDS_PER_CYCLE", "40")),
             require_all_regions=os.getenv("REQUIRE_ALL_REGIONS", "1").strip().lower()
             not in ("0", "false", "no"),
         )
@@ -254,6 +259,15 @@ class DB:
                WHERE products.data != excluded.data""",  # без изменений файл БД не трогаем
             [(region, p.id, p.to_json(), now, now) for p in products])
         self.conn.commit()
+
+    def prune(self, region: str, keep_ids: set) -> None:
+        """Удаляет записи региона, которых нет в keep_ids (товары вне текущего фильтра)."""
+        stale = [(region, r[0]) for r in
+                 self.conn.execute("SELECT pid FROM products WHERE region=?", (region,)).fetchall()
+                 if r[0] not in keep_ids]
+        if stale:
+            self.conn.executemany("DELETE FROM products WHERE region=? AND pid=?", stale)
+            self.conn.commit()
 
     def count(self, region: str) -> int:
         return self.conn.execute(
@@ -476,8 +490,12 @@ class ConsoleNotifier:
         return True
 
 
+TELEGRAM_MAX_WAIT = 60  # дольше этого на лимите Telegram не ждём: повторим в следующем проходе
+
+
 class Telegram:
     def __init__(self, token: str, chat_ids: list):
+        self.token = token
         self.api = f"https://api.telegram.org/bot{token}"
         self.chat_ids = chat_ids
         self.s = requests.Session()
@@ -487,13 +505,20 @@ class Telegram:
             try:
                 r = self.s.post(f"{self.api}/{method}", data=payload, timeout=30)
             except requests.RequestException as e:
-                log.warning("Telegram: сетевая ошибка: %s", e)
+                msg = str(e).replace(self.token, "***") if self.token else str(e)  # токен в логи не пишем
+                log.warning("Telegram: сетевая ошибка: %s", msg)
                 time.sleep(3)
                 continue
             if r.status_code == 200:
                 return True
             if r.status_code == 429:
-                wait = r.json().get("parameters", {}).get("retry_after", 5)
+                try:
+                    wait = int(r.json().get("parameters", {}).get("retry_after", 5))
+                except (ValueError, AttributeError, TypeError):
+                    wait = 5  # тело ответа не JSON — ждём немного
+                if wait > TELEGRAM_MAX_WAIT:
+                    log.warning("Telegram: лимит на %s с — отправку отложим на следующий проход", wait)
+                    return False
                 log.warning("Telegram: лимит, ждём %s с", wait)
                 time.sleep(wait + 1)
                 continue
@@ -579,17 +604,26 @@ def make_session(code: str) -> requests.Session:
     return s
 
 
+MAX_PAGES = 60  # страховка от бесконечного цикла (сейчас в каталоге ~9 страниц по 250)
+
+
 def fetch_catalog(session: requests.Session, code: str, delay: float,
                   max_pages: Optional[int] = None) -> list:
     """Весь каталог версии сайта (/products.json, постранично по 250)."""
-    products, page = [], 1
+    products, page, prev_first = [], 1, None
     while True:
         data = http_get(session, BASE + REGIONS[code]["path"] + "/products.json",
                         params={"limit": 250, "page": page}).json()
         batch = data.get("products", [])
+        first_id = batch[0].get("id") if batch else None
+        if batch and first_id == prev_first:
+            raise RegionError(f"{code}: сайт повторно отдал страницу {page - 1} — каталог не прочитан")
+        prev_first = first_id
         products.extend(batch)
         if len(batch) < 250 or (max_pages and page >= max_pages):
             break
+        if page >= MAX_PAGES:
+            raise RegionError(f"{code}: больше {MAX_PAGES} страниц каталога — похоже на сбой, цикл пропущен")
         page += 1
         time.sleep(delay)
     return products
@@ -613,16 +647,17 @@ def fetch_region(cfg: Config, code: str) -> list:
 
 def plan_region(cfg: Config, db: DB, code: str, mens: list) -> dict:
     """Сравнивает каталог региона со снимком. Ничего не пишет в БД и ничего не отправляет."""
-    known = db.count(code)
-    if known >= 50 and len(mens) < known * 0.5:
-        raise RegionError(f"{code}: получено {len(mens)} мужских товаров при {known} в базе — "
-                          f"похоже на неполный ответ сайта, цикл пропущен")
-
     first_run = db.meta_get(f"baseline:{code}") is None
     scope_changed = (not first_run) and db.meta_get(f"scope:{code}") != cfg.scope_signature()
     # при первом запуске или смене фильтра (например, добавили унисекс) новые позиции
     # запоминаем молча, чтобы не получить уведомления обо всех уже существующих скидках
     baseline = first_run or scope_changed
+
+    known = db.count(code)
+    # при смене фильтра число товаров может резко упасть (выключили унисекс) — это не неполный ответ
+    if not baseline and known >= 50 and len(mens) < known * 0.5:
+        raise RegionError(f"{code}: получено {len(mens)} мужских товаров при {known} в базе — "
+                          f"похоже на неполный ответ сайта, цикл пропущен")
     unchanged, events = [], {}
     for p in mens:
         if baseline:
@@ -637,6 +672,9 @@ def plan_region(cfg: Config, db: DB, code: str, mens: list) -> dict:
             "unchanged": unchanged, "events": events}
 
 
+DIGEST_LIMIT = 3800
+
+
 def process_plans(cfg: Config, db: DB, plans: list, notifier) -> dict:
     """Объединяет события по вещам из всех регионов и шлёт ОДНО уведомление на вещь
     (с ценами для каждой версии сайта). Снимок вещи обновляется только после успешной отправки."""
@@ -644,6 +682,8 @@ def process_plans(cfg: Config, db: DB, plans: list, notifier) -> dict:
     stats = {pl["code"]: {"men": len(pl["mens"]), "events": len(pl["events"]), "sent": 0,
                           "failed": 0, "baseline": pl["baseline"]} for pl in plans}
     for pl in plans:
+        if pl["baseline"]:
+            db.prune(pl["code"], {p.id for p in pl["mens"]})  # убираем товары, вышедшие из фильтра
         if pl["unchanged"]:
             db.save_many(pl["code"], pl["unchanged"])
 
@@ -671,12 +711,20 @@ def process_plans(cfg: Config, db: DB, plans: list, notifier) -> dict:
         done(evs, notifier.send(text, photo))
 
     # если событий слишком много (например, старт распродажи) — компактные сводки
-    for i in range(0, len(rest), 12):
-        chunk = rest[i:i + 12]
-        text = f"Ещё {len(rest)} позиций (сводка)\n\n" + "\n\n".join(
-            build_digest_item(evs, current[pid], regions) for pid, evs in chunk)
-        ok = notifier.send(text[:4000])
-        for _, evs in chunk:
+    header = f"Ещё {len(rest)} позиций (сводка)\n\n"
+    chunks, cur, size = [], [], len(header)
+    for pid, evs in rest:  # сообщение Telegram ≤ 4096 символов: делим по длине, чтобы ничего не обрезалось
+        line = build_digest_item(evs, current[pid], regions)
+        if cur and (size + len(line) + 2 > DIGEST_LIMIT or len(cur) >= 12):
+            chunks.append(cur)
+            cur, size = [], len(header)
+        cur.append((evs, line))
+        size += len(line) + 2
+    if cur:
+        chunks.append(cur)
+    for chunk in chunks:
+        ok = notifier.send(header + "\n\n".join(line for _, line in chunk))
+        for evs, _ in chunk:
             done(evs, ok)
 
     for pl in plans:
